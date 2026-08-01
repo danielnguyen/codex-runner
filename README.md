@@ -242,6 +242,12 @@ On startup, runs left in `queued` or `running` are marked `interrupted`; the run
 
 Keep the live data directory on a local filesystem. Atomic rename, exclusive creation, append behavior, locking semantics, and durability guarantees can differ on network filesystems. Runtime data can also contain prompts and model responses, so back it up and retain it according to the operator's data policy. Never place it inside a target repository.
 
+## Optional integrations
+
+Optional client adapters live under [`integrations/`](integrations/). They use the public HTTP API and are not dependencies of the runner core.
+
+- [Open WebUI Pipe](integrations/openwebui/README.md)
+
 ## Development
 
 Available commands:
