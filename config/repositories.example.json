@@ -1,0 +1,11 @@
+{
+  "repositories": [
+    {
+      "id": "example-repository",
+      "displayName": "Example Repository",
+      "path": "/srv/projects/example-repository",
+      "requireCleanWorktree": true,
+      "networkAccess": false
+    }
+  ]
+}
