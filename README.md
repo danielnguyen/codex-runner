@@ -29,7 +29,7 @@ This initial version provides:
 - run polling and SSE event replay;
 - restart recovery for abandoned runs.
 
-Explicit non-goals include Open WebUI integration, arbitrary client paths, arbitrary command endpoints, general queues, databases, distributed execution, automatic branch or pull-request management, and automatic merging.
+Explicit non-goals include arbitrary client paths, arbitrary command endpoints, general queues, databases, distributed execution, automatic branch or pull-request management, and automatic merging.
 
 ## Security boundaries and threat model
 
@@ -286,11 +286,8 @@ This exercises the real locally authenticated SDK. The automated tests use a fak
 ## Known limitations
 
 - Only one execution can be active across the entire runner.
-- There is no Open WebUI participant, Pipe, or approval Action yet.
 - There is no cancellation API. The installed SDK exposes `AbortSignal` for `runStreamed()`, but a durable, authenticated cancellation lifecycle is intentionally deferred rather than represented by a fake status-only endpoint.
 - The streamed SDK does not return a separate buffered result object. Like the SDK's own buffered implementation, the runner treats the latest completed agent-message item as the final response and records usage from `turn.completed`.
 - There is no automatic branch, commit, push, pull-request, or merge management in the runner.
 - The filesystem ledger is designed for one local process, not shared or distributed deployment.
 - Network-enabled repositories currently receive the SDK's boolean workspace network access control, not a per-domain runner allowlist. Prefer `networkAccess: false`.
-
-The planned next step is a thin Open WebUI Pipe plus an explicit approval Action that calls this API without weakening the request/hash boundary.
