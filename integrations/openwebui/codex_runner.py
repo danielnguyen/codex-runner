@@ -1,7 +1,7 @@
 """
 title: Codex
 author: codex-runner contributors
-version: 0.1.2
+version: 0.1.3
 required_open_webui_version: 0.11.0
 description: Submit explicitly approved Codex executions through codex-runner.
 """
@@ -571,6 +571,7 @@ class Pipe:
             repository_id = config["repository_id"]
             self._authorize(__user__)
             prompt = await extract_invocation_prompt(body, __metadata__, __request__)
+            is_channel_invocation = _channel_id_from_request(__request__) is not None
             if config["runner_token"] in prompt:
                 raise IntegrationError(
                     "SECRET_IN_PROMPT",
@@ -642,6 +643,7 @@ class Pipe:
                                 request_id,
                                 prompt_sha256,
                                 prompt,
+                                is_channel_invocation=is_channel_invocation,
                             )
                         )
 
@@ -1015,9 +1017,18 @@ class Pipe:
         request_id: str,
         prompt_sha256: str,
         prompt: str,
+        *,
+        is_channel_invocation: bool,
     ) -> str:
         byte_count = len(prompt.encode("utf-8"))
-        approval_command = f"@Codex approve {request_id} {prompt_sha256}"
+        approval_command = f"approve {request_id} {prompt_sha256}"
+        approval_instruction = (
+            "Type `@`, select **Codex** from the mention list, then paste:"
+            if is_channel_invocation
+            else "Send the exact approval command below:"
+        )
+        if not is_channel_invocation:
+            approval_command = f"@Codex {approval_command}"
         return (
             "## Codex execution pending approval\n\n"
             "Interactive confirmation was unavailable. The execution request "
@@ -1032,6 +1043,7 @@ class Pipe:
             "### Exact prompt\n\n"
             f"{prompt}\n\n"
             "### Explicit approval command\n\n"
+            f"{approval_instruction}\n\n"
             f"```text\n{approval_command}\n```"
         )
 

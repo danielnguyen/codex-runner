@@ -414,6 +414,33 @@ async def test_channel_normal_request_excludes_identity_and_routing_label() -> N
 
 
 @pytest.mark.asyncio
+async def test_channel_pending_response_explains_structured_mention_workflow() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=created_response())
+
+    prompt = "Inspect this repository without changing it."
+    decorated = f"Example Operator: Codex {prompt}"
+    result = await configured_pipe(handler).pipe(
+        channel_body(decorated),
+        {"role": "admin"},
+        channel_metadata(decorated),
+        None,
+        None,
+        channel_request(prompt),
+    )
+
+    command = f"approve {REQUEST_ID} {PROMPT_HASH}"
+    assert [request.url.path for request in requests] == ["/v1/execution-requests"]
+    assert "Type `@`, select **Codex** from the mention list, then paste:" in result
+    assert f"```text\n{command}\n```" in result
+    assert f"@Codex {command}" not in result
+    assert "No run has started" in result
+
+
+@pytest.mark.asyncio
 async def test_channel_approval_uses_raw_command_without_creating_request() -> None:
     requests: list[httpx.Request] = []
     command = approval_command(mention=False)

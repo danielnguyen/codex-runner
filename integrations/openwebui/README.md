@@ -100,8 +100,15 @@ Open WebUI may be unable to deliver an interactive confirmation dialog through a
 
 Use this explicit two-message flow:
 
-1. Send `@Codex <complete exact prompt>`.
-2. Review the durable pending response, then send its exact `@Codex approve <request-id> <prompt-sha256>` command.
+1. Type `@`, select **Codex** from Open WebUI's mention list, then enter the complete exact prompt.
+2. Review the durable pending response.
+3. For approval, type `@`, select **Codex** from the mention list again, then paste only:
+
+   ```text
+   approve <request-id> <prompt-sha256>
+   ```
+
+Pasting literal `@Codex` text does not create Open WebUI's structured model mention. Selecting Codex from the autocomplete provides the routing mention; the copyable command block intentionally starts with `approve` so it does not duplicate the visible mention.
 
 For both messages, the adapter obtains the persisted authored Channel message from the authoritative request source before normal request creation or approval-command parsing. The structured `@Codex` routing mention is excluded; no sender display name or plain model label is forwarded to codex-runner.
 
