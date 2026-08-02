@@ -10,6 +10,12 @@ node_modules/
 dist/
 coverage/
 .eslintcache
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
 .DS_Store
 Thumbs.db
 .idea/
