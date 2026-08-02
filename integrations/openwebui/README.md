@@ -56,9 +56,15 @@ Open WebUI must be able to reach `RUNNER_URL`. Prefer a private, authenticated n
 
 ## Exact-prompt and approval behavior
 
-The Pipe prefers Open WebUI's reserved `__metadata__["user_prompt"]`, which contains the current user message before source wrapping. A direct test/API path without metadata falls back to the latest plain-text user message in `body["messages"]`.
+In direct chat, the Pipe prefers Open WebUI's reserved `__metadata__["user_prompt"]`, which contains the current user message before source wrapping. A direct test/API path without metadata falls back to the latest plain-text user message in `body["messages"]`. Direct-chat prompt text is not altered.
 
-For normal execution requests, the selected string is preserved exactly. The Pipe does not trim, rewrite, summarize, prepend, append, combine history, include the system prompt, or resolve references such as “execute the plan above.” In a Channel, paste the complete Codex prompt into the message that invokes this Pipe. The maximum is 65,536 UTF-8 bytes. Attachments, sources, images, multimodal message content, and other non-text input are rejected. A prompt containing the configured runner token is also rejected before request creation so the secret cannot enter confirmation or durable output.
+The current Open WebUI Channel dispatch path is different: it stores the authored Channel message, replaces structured model mentions with their display labels, prepends the sender's display name, and supplies that decorated text to the chat-completion pipeline. Consequently, the generic `user_prompt` behavior documented for Pipes does not currently provide raw authored text in this Channel path.
+
+For a Channel invocation, the Pipe uses the supported `__request__` reserved argument. Open WebUI passes through the same FastAPI request accepted by the Channel message-post route, whose JSON body contains the persisted current message. The Pipe cross-checks the Channel route against `chat_id`, `session_id`, and `message_id` metadata. It then recognizes only Open WebUI's structured leading model-mention token for the exact invoked model and removes that routing token and its single separator. It does not heuristically strip arbitrary speaker names, `Codex`, `@Codex`, or text that resembles a prefix. A legitimate prompt beginning with those strings is preserved.
+
+If the raw Channel request, matching metadata, or unambiguous structured routing mention is unavailable, the Pipe returns `CHANNEL_RAW_PROMPT_UNAVAILABLE` before creating or approving any runner request. It never submits the decorated Channel prompt as a substitute.
+
+For normal execution requests, the selected string after authoritative Channel routing removal is preserved exactly. The Pipe does not trim, rewrite, summarize, prepend, append, combine history, include the system prompt, or resolve references such as “execute the plan above.” In a Channel, paste the complete Codex prompt into the message that invokes this Pipe. The maximum is 65,536 UTF-8 bytes. Attachments, sources, images, multimodal message content, and other non-text input are rejected. A prompt containing the configured runner token is also rejected before request creation so the secret cannot enter confirmation or durable output.
 
 The only interpreted message syntax is a complete explicit approval command:
 
@@ -97,6 +103,8 @@ Use this explicit two-message flow:
 1. Send `@Codex <complete exact prompt>`.
 2. Review the durable pending response, then send its exact `@Codex approve <request-id> <prompt-sha256>` command.
 
+For both messages, the adapter obtains the persisted authored Channel message from the authoritative request source before normal request creation or approval-command parsing. The structured `@Codex` routing mention is excluded; no sender display name or plain model label is forwarded to codex-runner.
+
 The second invocation does not create another request. The adapter fetches `GET /v1/execution-requests/:requestId` and verifies the returned request ID, configured repository ID, stored prompt, exact stored hash, and pending or idempotently-started status before calling approval with the stored hash. A wrong identifier, hash, repository, missing request, or conflicting status cannot start a run.
 
 No run starts until either the direct-chat modal is positively confirmed or the exact second-message approval command is verified. Sending that command is explicit authorization to start Codex in the configured allowlisted repository.
@@ -118,6 +126,7 @@ codex-runner has no durable cancellation API. Closing the browser tab or losing 
 - **Execution already active:** codex-runner permits one active execution globally. Wait for it to finish before approving another request.
 - **Browser closed during confirmation:** the confirmation call fails or times out. The Pipe does not approve the request; when delivery remains available, its durable response supplies the explicit approval command.
 - **Browser closed after approval:** live UI delivery can stop, but the runner continues. Use its authenticated run endpoint and recorded IDs to inspect the outcome.
+- **`CHANNEL_RAW_PROMPT_UNAVAILABLE`:** Open WebUI did not expose a consistent raw Channel message for this invocation. The Pipe refused before request creation or approval; retry from a supported context instead of copying decorated prompt text.
 
 ## Local integration tests
 

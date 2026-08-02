@@ -1,7 +1,7 @@
 """
 title: Codex
 author: codex-runner contributors
-version: 0.1.1
+version: 0.1.2
 required_open_webui_version: 0.11.0
 description: Submit explicitly approved Codex executions through codex-runner.
 """
@@ -38,6 +38,11 @@ APPROVAL_PREFIX_RE = re.compile(r"^(?:(?i:@codex)\s+)?(?i:approve)(?:\s|$)")
 EMBEDDED_APPROVAL_COMMAND_RE = re.compile(
     rf"(?<![A-Za-z0-9_]){APPROVAL_COMMAND_PATTERN}"
 )
+CHANNEL_MESSAGE_PATH_RE = re.compile(
+    r"^/api/v1/channels/(?P<channel_id>[^/]+)/messages/post/?$"
+)
+MODEL_MENTION_RE = re.compile(r"<@M:(?P<model_id>[^|>]+)(?:\|(?P<label>[^>]*))?>")
+ROUTING_DISPLAY_NAME = "Codex"
 
 
 class IntegrationError(Exception):
@@ -160,6 +165,119 @@ def extract_exact_prompt(
             f"The execution prompt exceeds {MAX_PROMPT_BYTES:,} UTF-8 bytes.",
         )
     return prompt
+
+
+def _channel_error(message: str) -> IntegrationError:
+    return IntegrationError("CHANNEL_RAW_PROMPT_UNAVAILABLE", message)
+
+
+def _channel_id_from_metadata(metadata: Mapping[str, Any] | None) -> str | None:
+    if metadata is None:
+        return None
+    chat_id = metadata.get("chat_id")
+    session_id = metadata.get("session_id")
+    channel_ids: list[str] = []
+    for value in (chat_id, session_id):
+        if isinstance(value, str) and value.startswith("channel:"):
+            channel_ids.append(value.removeprefix("channel:"))
+    if not channel_ids:
+        return None
+    if len(channel_ids) != 2 or channel_ids[0] != channel_ids[1]:
+        raise _channel_error("Open WebUI supplied inconsistent Channel metadata.")
+    message_id = metadata.get("message_id")
+    if not isinstance(message_id, str) or not message_id:
+        raise _channel_error(
+            "Open WebUI did not supply valid Channel message metadata."
+        )
+    return channel_ids[0]
+
+
+def _channel_id_from_request(request: Any) -> str | None:
+    if request is None:
+        return None
+    method = getattr(request, "method", None)
+    url = getattr(request, "url", None)
+    path = getattr(url, "path", None)
+    if method != "POST" or not isinstance(path, str):
+        return None
+    match = CHANNEL_MESSAGE_PATH_RE.fullmatch(path)
+    return match.group("channel_id") if match is not None else None
+
+
+def _extract_channel_prompt(raw_content: Any, model_id: Any) -> str:
+    if not isinstance(raw_content, str):
+        raise _channel_error("Open WebUI did not supply a plain-text Channel message.")
+    if not isinstance(model_id, str) or not model_id:
+        raise _channel_error("Open WebUI did not identify the invoked Channel model.")
+
+    mentions = list(MODEL_MENTION_RE.finditer(raw_content))
+    if not mentions:
+        # Open WebUI also invokes a model when a user replies to that model's
+        # Channel message. No routing token is present in that authored content.
+        return raw_content
+
+    routing = mentions[0]
+    if (
+        routing.start() != 0
+        or routing.group("model_id") != model_id
+        or routing.group("label") != ROUTING_DISPLAY_NAME
+        or len(mentions) != 1
+    ):
+        raise _channel_error(
+            "Open WebUI supplied an ambiguous Channel model-mention payload."
+        )
+
+    prompt = raw_content[routing.end() :]
+    # TipTap serializes the selected mention separately from the following
+    # separator. Remove one ordinary separator, preserving all authored prompt
+    # content after it byte-for-byte as a Python string.
+    return prompt[1:] if prompt.startswith(" ") else prompt
+
+
+async def extract_invocation_prompt(
+    body: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None,
+    request: Any,
+) -> str:
+    metadata_channel_id = _channel_id_from_metadata(metadata)
+    request_channel_id = _channel_id_from_request(request)
+
+    if metadata_channel_id is None and request_channel_id is None:
+        return extract_exact_prompt(body, metadata)
+    if (
+        metadata_channel_id is None
+        or request_channel_id is None
+        or metadata_channel_id != request_channel_id
+    ):
+        raise _channel_error(
+            "Open WebUI supplied only a decorated Channel prompt; the exact "
+            "authored message could not be recovered."
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise _channel_error(
+            "Open WebUI's raw Channel message could not be read safely."
+        ) from None
+    if not isinstance(payload, Mapping):
+        raise _channel_error("Open WebUI supplied malformed Channel message data.")
+
+    data = payload.get("data")
+    if data is not None and not isinstance(data, Mapping):
+        raise _channel_error("Open WebUI supplied malformed Channel message data.")
+    if isinstance(data, Mapping) and data.get("files"):
+        raise IntegrationError(
+            "UNSUPPORTED_INPUT",
+            "Attachments, sources, and multimodal input are not supported.",
+        )
+
+    prompt = _extract_channel_prompt(payload.get("content"), body.get("model"))
+    # Reuse the common exact-text validation without allowing the decorated
+    # model prompt or thread history to become a fallback source.
+    return extract_exact_prompt(
+        {"messages": [{"role": "user", "content": prompt}]}, None
+    )
 
 
 @dataclass(frozen=True)
@@ -441,6 +559,7 @@ class Pipe:
         __metadata__: dict[str, Any] | None = None,
         __event_emitter__: EventEmitter | None = None,
         __event_call__: EventCall | None = None,
+        __request__: Any = None,
     ) -> str:
         request_id: str | None = None
         run_id: str | None = None
@@ -451,7 +570,7 @@ class Pipe:
             config = self._validated_config()
             repository_id = config["repository_id"]
             self._authorize(__user__)
-            prompt = extract_exact_prompt(body, __metadata__)
+            prompt = await extract_invocation_prompt(body, __metadata__, __request__)
             if config["runner_token"] in prompt:
                 raise IntegrationError(
                     "SECRET_IN_PROMPT",

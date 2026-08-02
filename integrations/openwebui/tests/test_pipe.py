@@ -11,6 +11,7 @@ from codex_runner import (
     IntegrationError,
     Pipe,
     extract_exact_prompt,
+    extract_invocation_prompt,
     parse_approval_command,
 )
 
@@ -19,6 +20,23 @@ RUN_ID = "run-example"
 PROMPT_HASH = "a" * 64
 TOKEN = "REPLACE_WITH_RANDOM_TOKEN"
 REPOSITORY_ID = "example-repository"
+CHANNEL_ID = "example-channel"
+MODEL_ID = "codex"
+
+
+class FakeChannelRequest:
+    method = "POST"
+
+    def __init__(self, payload: Any, *, channel_id: str = CHANNEL_ID) -> None:
+        self.url = httpx.URL(
+            f"http://openwebui.example.invalid/api/v1/channels/{channel_id}/messages/post"
+        )
+        self._payload = payload
+
+    async def json(self) -> Any:
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
 
 
 def configured_pipe(
@@ -206,6 +224,27 @@ def body(prompt: Any = "Exact prompt") -> dict[str, Any]:
     }
 
 
+def channel_body(decorated_prompt: str) -> dict[str, Any]:
+    request_body = body(decorated_prompt)
+    request_body["model"] = MODEL_ID
+    return request_body
+
+
+def channel_metadata(decorated_prompt: str) -> dict[str, Any]:
+    return {
+        "chat_id": f"channel:{CHANNEL_ID}",
+        "session_id": f"channel:{CHANNEL_ID}",
+        "message_id": "assistant-message-example",
+        "user_prompt": decorated_prompt,
+    }
+
+
+def channel_request(prompt: str) -> FakeChannelRequest:
+    return FakeChannelRequest(
+        {"content": f"<@M:{MODEL_ID}|Codex> {prompt}", "data": {"files": []}}
+    )
+
+
 def approval_command(*, mention: bool = True) -> str:
     prefix = "@Codex " if mention else ""
     return f"{prefix}approve {REQUEST_ID} {PROMPT_HASH}"
@@ -310,6 +349,175 @@ def test_source_wrapped_body_does_not_replace_metadata_prompt() -> None:
         extract_exact_prompt(body(wrapped), {"user_prompt": "Exact prompt"})
         == "Exact prompt"
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_chat_raw_prompt_remains_unchanged() -> None:
+    prompt = "Example Operator: Codex must remain literal.  "
+
+    assert (
+        await extract_invocation_prompt(
+            body("wrapped body"), {"user_prompt": prompt}, None
+        )
+        == prompt
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Inspect this repository exactly.\nDo not modify anything.",
+        "Example Operator: preserve this legitimate prefix.",
+        "Codex is a legitimate first word in this prompt.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_channel_prompt_uses_authoritative_raw_request(prompt: str) -> None:
+    decorated = f"Example Operator: Codex {prompt}"
+
+    assert (
+        await extract_invocation_prompt(
+            channel_body(decorated),
+            channel_metadata(decorated),
+            channel_request(prompt),
+        )
+        == prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_channel_normal_request_excludes_identity_and_routing_label() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=created_response())
+
+    prompt = (
+        "Inspect this repository and report whether its working tree is clean.\n"
+        "Do not create, modify, delete, stage, or commit anything."
+    )
+    decorated = f"Example Operator: Codex {prompt}"
+    result = await configured_pipe(handler).pipe(
+        channel_body(decorated),
+        {"role": "admin"},
+        channel_metadata(decorated),
+        None,
+        reject,
+        channel_request(prompt),
+    )
+
+    assert len(requests) == 1
+    assert json.loads(requests[0].content)["prompt"] == prompt
+    assert "Example Operator" not in json.loads(requests[0].content)["prompt"]
+    assert result.startswith("## Codex execution rejected")
+
+
+@pytest.mark.asyncio
+async def test_channel_approval_uses_raw_command_without_creating_request() -> None:
+    requests: list[httpx.Request] = []
+    command = approval_command(mention=False)
+    decorated = f"Example Operator: Codex {command}"
+
+    result = await configured_pipe(approval_command_handler(requests)).pipe(
+        channel_body(decorated),
+        {"role": "admin"},
+        channel_metadata(decorated),
+        None,
+        None,
+        channel_request(command),
+    )
+
+    paths = [request.url.path for request in requests]
+    assert paths[0] == f"/v1/execution-requests/{REQUEST_ID}"
+    assert "/v1/execution-requests" not in paths
+    assert paths.count(f"/v1/execution-requests/{REQUEST_ID}/approve") == 1
+    assert "Finished safely." in result
+
+
+@pytest.mark.asyncio
+async def test_decorated_only_channel_input_fails_closed_before_runner_call() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    decorated = "Example Operator: Codex inspect this repository."
+    result = await configured_pipe(handler).pipe(
+        channel_body(decorated),
+        {"role": "admin"},
+        channel_metadata(decorated),
+    )
+
+    assert calls == 0
+    assert "CHANNEL_RAW_PROMPT_UNAVAILABLE" in result
+    assert "decorated Channel prompt" in result
+
+
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        f"Before <@M:{MODEL_ID}|Codex> ambiguous",
+        "<@M:another-model|Codex> wrong model",
+        f"<@M:{MODEL_ID}|Different Label> wrong label",
+        f"<@M:{MODEL_ID}|Codex> prompt <@M:another-model|Other> extra mention",
+    ],
+)
+@pytest.mark.asyncio
+async def test_ambiguous_channel_mentions_fail_closed(raw_content: str) -> None:
+    decorated = "Example Operator: decorated model prompt"
+
+    with pytest.raises(IntegrationError) as raised:
+        await extract_invocation_prompt(
+            channel_body(decorated),
+            channel_metadata(decorated),
+            FakeChannelRequest({"content": raw_content, "data": {"files": []}}),
+        )
+
+    assert raised.value.code == "CHANNEL_RAW_PROMPT_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "channel_request_obj"),
+    [
+        ({"chat_id": f"channel:{CHANNEL_ID}"}, None),
+        (
+            {
+                "chat_id": f"channel:{CHANNEL_ID}",
+                "session_id": "channel:different-channel",
+                "message_id": "assistant-message-example",
+            },
+            channel_request("Exact prompt"),
+        ),
+        (
+            {
+                "chat_id": f"channel:{CHANNEL_ID}",
+                "session_id": f"channel:{CHANNEL_ID}",
+            },
+            channel_request("Exact prompt"),
+        ),
+        (
+            channel_metadata("decorated"),
+            FakeChannelRequest({"data": {"files": []}}),
+        ),
+        (
+            channel_metadata("decorated"),
+            FakeChannelRequest(ValueError("body unavailable")),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_missing_or_malformed_channel_source_fails_closed(
+    metadata: dict[str, Any], channel_request_obj: FakeChannelRequest | None
+) -> None:
+    with pytest.raises(IntegrationError) as raised:
+        await extract_invocation_prompt(
+            channel_body("decorated"), metadata, channel_request_obj
+        )
+
+    assert raised.value.code == "CHANNEL_RAW_PROMPT_UNAVAILABLE"
 
 
 @pytest.mark.parametrize(
