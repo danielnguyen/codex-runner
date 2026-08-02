@@ -1,6 +1,6 @@
 # Open WebUI Pipe
 
-This optional Pipe Function makes codex-runner available as a selectable Open WebUI model. It sends only the current plain-text user message to one administrator-configured repository ID, displays an explicit confirmation dialog, approves with the runner-issued prompt hash, follows normalized Server-Sent Events (SSE), and returns the final Codex response as durable assistant content.
+This optional Pipe Function makes codex-runner available as a selectable Open WebUI model named **Codex**. It sends only the current plain-text user message to one administrator-configured repository ID, requires explicit human authorization, follows normalized Server-Sent Events (SSE), and returns the final Codex response as durable assistant content.
 
 The Pipe contains no Codex execution logic. Its dependency direction is:
 
@@ -12,7 +12,7 @@ Open WebUI Pipe -> codex-runner HTTP API -> Codex SDK
 
 Open WebUI owns chat interaction, administrator Valve configuration, access to the Pipe, and the live confirmation dialog. codex-runner remains authoritative for bearer authentication, repository allowlisting and policy, immutable request storage, prompt-hash validation, global concurrency, Codex execution, and durable persistence.
 
-The Pipe fails closed when interactive confirmation or administrator role information is unavailable. It never accepts a repository ID, hash, runner URL, token, execution option, or arbitrary API path from chat content. It never auto-approves.
+The Pipe fails closed when administrator role information is unavailable. It never accepts a repository ID, runner URL, token, execution option, or arbitrary API path from chat content. A hash and request ID are accepted only in the exact approval-command form described below. It never auto-approves or infers a pending request.
 
 Status updates contain only fixed descriptions and identifiers appear only in the durable result. Raw command text, command output, paths, hidden reasoning, prior chat messages, and authentication material are not emitted.
 
@@ -58,17 +58,48 @@ Open WebUI must be able to reach `RUNNER_URL`. Prefer a private, authenticated n
 
 The Pipe prefers Open WebUI's reserved `__metadata__["user_prompt"]`, which contains the current user message before source wrapping. A direct test/API path without metadata falls back to the latest plain-text user message in `body["messages"]`.
 
-The selected string is preserved exactly. The Pipe does not trim, rewrite, summarize, prepend, append, interpret mentions, combine history, include the system prompt, or resolve references such as “execute the plan above.” In a Channel, paste the complete Codex prompt into the message that invokes this Pipe. The maximum is 65,536 UTF-8 bytes. Attachments, sources, images, multimodal message content, and other non-text input are rejected. A prompt containing the configured runner token is also rejected before request creation so the secret cannot enter confirmation or durable output.
+For normal execution requests, the selected string is preserved exactly. The Pipe does not trim, rewrite, summarize, prepend, append, combine history, include the system prompt, or resolve references such as “execute the plan above.” In a Channel, paste the complete Codex prompt into the message that invokes this Pipe. The maximum is 65,536 UTF-8 bytes. Attachments, sources, images, multimodal message content, and other non-text input are rejected. A prompt containing the configured runner token is also rejected before request creation so the secret cannot enter confirmation or durable output.
 
-The lifecycle is:
+The only interpreted message syntax is a complete explicit approval command:
 
-1. Validate configuration, role, confirmation support, and the exact prompt.
+```text
+approve <request-id> <prompt-sha256>
+```
+
+An optional routing mention is accepted:
+
+```text
+@Codex approve <request-id> <prompt-sha256>
+```
+
+The `approve` verb and `@Codex` mention are case-insensitive. The request ID must be a complete lowercase UUID, and the hash must contain exactly 64 lowercase hexadecimal characters. Missing or abbreviated identifiers, uppercase hashes, extra instructions, embedded commands, and `approve latest` are rejected. No repository ID or prompt is accepted in this command.
+
+### Direct-chat modal approval
+
+The direct-chat lifecycle is:
+
+1. Validate configuration, role, and the exact prompt.
 2. Create an immutable `pending_approval` request through codex-runner.
 3. Display the configured repository ID, runner request ID, exact SHA-256, UTF-8 byte count, and full exact prompt in an Open WebUI confirmation dialog.
 4. If confirmed, submit exactly the hash returned by request creation to the approval endpoint.
 5. Follow the existing run ID through the runner SSE endpoint and return the final run record as one durable Markdown response.
 
-Rejecting, closing, or timing out the dialog does not call approval. The durable response records that no run started and that the pending immutable request was not deleted.
+Clicking Cancel is an explicit rejection. The Pipe reports that distinct outcome, does not call approval, and leaves the immutable request pending with no run.
+
+If the confirmation call raises, times out, disconnects, or returns an unsupported result, the Pipe does not describe the outcome as rejection. It returns a durable pending-approval response containing the full exact prompt, identifiers, byte count, and explicit approval command.
+
+### Channel two-message approval
+
+Open WebUI may be unable to deliver an interactive confirmation dialog through a Channel session even though request creation succeeds. This is an Open WebUI client-integration behavior, not a codex-runner core limitation. The Pipe safely falls back after the failed confirmation call.
+
+Use this explicit two-message flow:
+
+1. Send `@Codex <complete exact prompt>`.
+2. Review the durable pending response, then send its exact `@Codex approve <request-id> <prompt-sha256>` command.
+
+The second invocation does not create another request. The adapter fetches `GET /v1/execution-requests/:requestId` and verifies the returned request ID, configured repository ID, stored prompt, exact stored hash, and pending or idempotently-started status before calling approval with the stored hash. A wrong identifier, hash, repository, missing request, or conflicting status cannot start a run.
+
+No run starts until either the direct-chat modal is positively confirmed or the exact second-message approval command is verified. Sending that command is explicit authorization to start Codex in the configured allowlisted repository.
 
 ## Progress, fallback, and cancellation
 
@@ -76,7 +107,7 @@ The Pipe emits only fixed, non-sensitive `status` events. It does not emit assis
 
 SSE replay begins with the runner's persisted events and follows the active run to a terminal event. If streaming fails after a run ID exists, the Pipe reports that live updates were interrupted and polls `GET /v1/runs/:runId` within the configured wait limit. It does not create another request, approve again, or start another run.
 
-codex-runner has no durable cancellation API. Closing the browser tab can interrupt confirmation or live UI updates, but it does not cancel an already approved execution. A client wait timeout likewise does not cancel or locally relabel the run.
+codex-runner has no durable cancellation API. Closing the browser tab or losing the Channel response path before approval leaves the immutable request pending; it neither approves nor cancels anything. After approval, losing the UI path can interrupt live updates but does not cancel the execution. A client wait timeout likewise does not cancel or locally relabel the run.
 
 ## Troubleshooting
 
@@ -85,7 +116,7 @@ codex-runner has no durable cancellation API. Closing the browser tab can interr
 - **Repository unavailable:** verify the configured `REPOSITORY_ID` exists and that codex-runner can revalidate its server-side path.
 - **Dirty worktree:** clean the allowlisted disposable or working repository according to operator policy; the Pipe cannot override this check.
 - **Execution already active:** codex-runner permits one active execution globally. Wait for it to finish before approving another request.
-- **Browser closed during confirmation:** the confirmation call fails or times out and the Pipe does not approve the pending request.
+- **Browser closed during confirmation:** the confirmation call fails or times out. The Pipe does not approve the request; when delivery remains available, its durable response supplies the explicit approval command.
 - **Browser closed after approval:** live UI delivery can stop, but the runner continues. Use its authenticated run endpoint and recorded IDs to inspect the outcome.
 
 ## Local integration tests

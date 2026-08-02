@@ -1,7 +1,7 @@
 """
-title: Codex Runner
+title: Codex
 author: codex-runner contributors
-version: 0.1.0
+version: 0.1.1
 required_open_webui_version: 0.11.0
 description: Submit explicitly approved Codex executions through codex-runner.
 """
@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -24,6 +25,19 @@ TERMINAL_EVENT_TYPES = {"run.completed", "run.failed", "run.interrupted"}
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[Any]]
 EventCall = Callable[[dict[str, Any]], Awaitable[Any]]
+ConfirmationOutcome = Literal["confirmed", "rejected", "unavailable"]
+
+UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+HASH_PATTERN = r"[0-9a-f]{64}"
+APPROVAL_COMMAND_PATTERN = (
+    rf"(?:(?i:@codex)[ \t]+)?(?i:approve)[ \t]+"
+    rf"(?P<request_id>{UUID_PATTERN})[ \t]+(?P<prompt_sha256>{HASH_PATTERN})"
+)
+APPROVAL_COMMAND_RE = re.compile(rf"^{APPROVAL_COMMAND_PATTERN}$")
+APPROVAL_PREFIX_RE = re.compile(r"^(?:(?i:@codex)\s+)?(?i:approve)(?:\s|$)")
+EMBEDDED_APPROVAL_COMMAND_RE = re.compile(
+    rf"(?<![A-Za-z0-9_]){APPROVAL_COMMAND_PATTERN}"
+)
 
 
 class IntegrationError(Exception):
@@ -37,6 +51,28 @@ class IntegrationError(Exception):
 
 class RunnerClientError(IntegrationError):
     """A sanitized codex-runner API failure."""
+
+
+@dataclass(frozen=True)
+class ApprovalCommand:
+    request_id: str
+    prompt_sha256: str
+
+
+def parse_approval_command(prompt: str) -> ApprovalCommand | None:
+    match = APPROVAL_COMMAND_RE.fullmatch(prompt)
+    if match is not None:
+        return ApprovalCommand(
+            request_id=match.group("request_id"),
+            prompt_sha256=match.group("prompt_sha256"),
+        )
+    if APPROVAL_PREFIX_RE.search(prompt) or EMBEDDED_APPROVAL_COMMAND_RE.search(prompt):
+        raise IntegrationError(
+            "INVALID_APPROVAL_COMMAND",
+            "Approval commands must exactly match "
+            "'@Codex approve <request-id> <prompt-sha256>'.",
+        )
+    return None
 
 
 def normalize_runner_url(value: str) -> str:
@@ -249,6 +285,9 @@ class RunnerClient:
             json_body={"repositoryId": repository_id, "prompt": prompt},
         )
 
+    async def get_request(self, request_id: str) -> dict[str, Any]:
+        return await self._json_request("GET", f"/v1/execution-requests/{request_id}")
+
     async def approve_request(
         self, request_id: str, prompt_sha256: str
     ) -> dict[str, Any]:
@@ -412,22 +451,14 @@ class Pipe:
             config = self._validated_config()
             repository_id = config["repository_id"]
             self._authorize(__user__)
-            if not callable(__event_call__):
-                raise IntegrationError(
-                    "CONFIRMATION_UNAVAILABLE",
-                    "Interactive confirmation is unavailable; "
-                    "no execution request was created.",
-                )
             prompt = extract_exact_prompt(body, __metadata__)
             if config["runner_token"] in prompt:
                 raise IntegrationError(
                     "SECRET_IN_PROMPT",
                     "The prompt contains the configured runner token and was rejected.",
                 )
+            approval_command = parse_approval_command(prompt)
 
-            await self._emit_status(
-                __event_emitter__, "Creating guarded execution request…"
-            )
             async with RunnerClient(
                 base_url=config["runner_url"],
                 token=config["runner_token"],
@@ -435,30 +466,69 @@ class Pipe:
                 api_timeout=config["api_timeout"],
                 transport=self._transport,
             ) as client:
-                request = await client.create_request(repository_id, prompt)
-                request_id, prompt_sha256 = self._validate_created_request(
-                    request, repository_id
-                )
-
-                confirmed = await self._request_confirmation(
-                    __event_call__,
-                    repository_id=repository_id,
-                    request_id=request_id,
-                    prompt_sha256=prompt_sha256,
-                    prompt=prompt,
-                )
-                if not confirmed:
+                if approval_command is not None:
                     await self._emit_status(
-                        __event_emitter__, "Execution was not approved.", done=True
+                        __event_emitter__, "Verifying pending execution request…"
                     )
-                    return self._redact_token(
-                        self._not_approved_result(
-                            repository_id, request_id, prompt_sha256
+                    request_id = approval_command.request_id
+                    request = await client.get_request(request_id)
+                    stored_prompt, prompt_sha256 = self._validate_fetched_request(
+                        request,
+                        approval_command,
+                        repository_id,
+                    )
+                    if config["runner_token"] in stored_prompt:
+                        raise IntegrationError(
+                            "SECRET_IN_PROMPT",
+                            "The stored prompt contains the configured runner token "
+                            "and was rejected.",
                         )
+                else:
+                    await self._emit_status(
+                        __event_emitter__, "Creating guarded execution request…"
                     )
+                    request = await client.create_request(repository_id, prompt)
+                    request_id, prompt_sha256 = self._validate_created_request(
+                        request, repository_id
+                    )
+
+                    confirmation = await self._request_confirmation(
+                        __event_call__,
+                        repository_id=repository_id,
+                        request_id=request_id,
+                        prompt_sha256=prompt_sha256,
+                        prompt=prompt,
+                    )
+                    if confirmation == "rejected":
+                        await self._emit_status(
+                            __event_emitter__,
+                            "Execution was explicitly rejected.",
+                            done=True,
+                        )
+                        return self._redact_token(
+                            self._rejected_result(
+                                repository_id, request_id, prompt_sha256
+                            )
+                        )
+                    if confirmation == "unavailable":
+                        await self._emit_status(
+                            __event_emitter__,
+                            "Interactive confirmation unavailable; "
+                            "request pending approval.",
+                            done=True,
+                        )
+                        return self._redact_token(
+                            self._pending_approval_result(
+                                repository_id,
+                                request_id,
+                                prompt_sha256,
+                                prompt,
+                            )
+                        )
 
                 await self._emit_status(
-                    __event_emitter__, "Request approved; starting guarded execution…"
+                    __event_emitter__,
+                    "Explicit authorization received; starting guarded execution…",
                 )
                 approval = await client.approve_request(request_id, prompt_sha256)
                 run_id = self._validate_approval(approval, request_id)
@@ -562,18 +632,20 @@ class Pipe:
             return
         if user is None or user.get("role") != "admin":
             raise IntegrationError(
-                "FORBIDDEN", "This Codex Runner Pipe is restricted to administrators."
+                "FORBIDDEN", "This Codex Pipe is restricted to administrators."
             )
 
     async def _request_confirmation(
         self,
-        event_call: EventCall,
+        event_call: EventCall | None,
         *,
         repository_id: str,
         request_id: str,
         prompt_sha256: str,
         prompt: str,
-    ) -> bool:
+    ) -> ConfirmationOutcome:
+        if not callable(event_call):
+            return "unavailable"
         byte_count = len(prompt.encode("utf-8"))
         message = (
             "Confirmation will start Codex in the configured "
@@ -596,8 +668,12 @@ class Pipe:
                 }
             )
         except Exception:
-            return False
-        return result is True
+            return "unavailable"
+        if result is True:
+            return "confirmed"
+        if result is False:
+            return "rejected"
+        return "unavailable"
 
     def _validate_created_request(
         self, request: Mapping[str, Any], repository_id: str
@@ -619,6 +695,59 @@ class Pipe:
                 "Runner returned an invalid execution-request response.",
             )
         return request_id, prompt_sha256
+
+    def _validate_fetched_request(
+        self,
+        request: Mapping[str, Any],
+        command: ApprovalCommand,
+        repository_id: str,
+    ) -> tuple[str, str]:
+        request_id = request.get("requestId")
+        stored_repository_id = request.get("repositoryId")
+        prompt_sha256 = request.get("promptSha256")
+        prompt = request.get("prompt")
+        status = request.get("status")
+        run_id = request.get("runId")
+
+        if request_id != command.request_id:
+            raise IntegrationError(
+                "APPROVAL_REQUEST_MISMATCH",
+                "Runner returned a different execution request.",
+            )
+        if stored_repository_id != repository_id:
+            raise IntegrationError(
+                "APPROVAL_REPOSITORY_MISMATCH",
+                "The execution request belongs to a different configured repository.",
+            )
+        if not isinstance(prompt_sha256, str) or prompt_sha256 != command.prompt_sha256:
+            raise IntegrationError(
+                "APPROVAL_HASH_MISMATCH",
+                "The supplied prompt hash does not match the immutable request.",
+            )
+        if not isinstance(prompt, str):
+            raise IntegrationError(
+                "INVALID_RUNNER_RESPONSE",
+                "Runner returned an execution request without a text prompt.",
+            )
+        if status == "pending_approval":
+            if run_id is not None:
+                raise IntegrationError(
+                    "INVALID_RUNNER_RESPONSE",
+                    "Pending execution request unexpectedly contains a run ID.",
+                )
+        elif status in {"queued", "running", "completed"}:
+            if not isinstance(run_id, str) or not run_id:
+                raise IntegrationError(
+                    "INVALID_RUNNER_RESPONSE",
+                    "Started execution request does not contain a run ID.",
+                )
+        else:
+            raise IntegrationError(
+                "REQUEST_NOT_APPROVABLE",
+                "The execution request is not pending or in an "
+                "idempotent started state.",
+            )
+        return prompt, prompt_sha256
 
     def _validate_approval(self, approval: Mapping[str, Any], request_id: str) -> str:
         run_id = approval.get("runId")
@@ -748,15 +877,43 @@ class Pipe:
             # Status delivery is supplementary and must not duplicate execution.
             return
 
-    def _not_approved_result(
+    def _rejected_result(
         self, repository_id: str, request_id: str, prompt_sha256: str
     ) -> str:
         return (
-            "## Codex execution not approved\n\n"
-            "No run was started. The immutable pending request was not deleted.\n\n"
+            "## Codex execution rejected\n\n"
+            "The execution was explicitly rejected in the confirmation dialog. "
+            "No run was started, and the immutable request remains pending.\n\n"
+            "- Status: `explicitly rejected`\n"
             f"- Repository ID: `{repository_id}`\n"
             f"- Request ID: `{request_id}`\n"
             f"- Prompt SHA-256: `{prompt_sha256}`"
+        )
+
+    def _pending_approval_result(
+        self,
+        repository_id: str,
+        request_id: str,
+        prompt_sha256: str,
+        prompt: str,
+    ) -> str:
+        byte_count = len(prompt.encode("utf-8"))
+        approval_command = f"@Codex approve {request_id} {prompt_sha256}"
+        return (
+            "## Codex execution pending approval\n\n"
+            "Interactive confirmation was unavailable. The execution request "
+            "remains pending approval. No run has started.\n\n"
+            "Sending the exact approval command below is an explicit authorization "
+            "to start Codex in the configured allowlisted repository.\n\n"
+            "- Status: `pending approval`\n"
+            f"- Repository ID: `{repository_id}`\n"
+            f"- Request ID: `{request_id}`\n"
+            f"- Prompt SHA-256: `{prompt_sha256}`\n"
+            f"- Prompt size: {byte_count} UTF-8 bytes\n\n"
+            "### Exact prompt\n\n"
+            f"{prompt}\n\n"
+            "### Explicit approval command\n\n"
+            f"```text\n{approval_command}\n```"
         )
 
     def _durable_run_result(

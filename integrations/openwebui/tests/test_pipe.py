@@ -11,9 +11,10 @@ from codex_runner import (
     IntegrationError,
     Pipe,
     extract_exact_prompt,
+    parse_approval_command,
 )
 
-REQUEST_ID = "request-example"
+REQUEST_ID = "aaaaaaaa-1111-4111-8111-111111111111"
 RUN_ID = "run-example"
 PROMPT_HASH = "a" * 64
 TOKEN = "REPLACE_WITH_RANDOM_TOKEN"
@@ -43,6 +44,28 @@ def created_response() -> dict[str, Any]:
         "status": "pending_approval",
         "createdAt": "2026-01-01T00:00:00.000Z",
     }
+
+
+def fetched_request_response(
+    *,
+    request_id: str = REQUEST_ID,
+    repository_id: str = REPOSITORY_ID,
+    prompt_sha256: str = PROMPT_HASH,
+    prompt: Any = "Exact prompt",
+    status: str = "pending_approval",
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "requestId": request_id,
+        "repositoryId": repository_id,
+        "promptSha256": prompt_sha256,
+        "prompt": prompt,
+        "status": status,
+        "createdAt": "2026-01-01T00:00:00.000Z",
+    }
+    if run_id is not None:
+        response["runId"] = run_id
+    return response
 
 
 def approval_response() -> dict[str, Any]:
@@ -86,6 +109,8 @@ def lifecycle_handler(
         requests.append(request)
         if request.url.path == "/v1/execution-requests":
             return httpx.Response(201, json=created_response())
+        if request.url.path == f"/v1/execution-requests/{REQUEST_ID}":
+            return httpx.Response(200, json=fetched_request_response())
         if request.url.path == f"/v1/execution-requests/{REQUEST_ID}/approve":
             return httpx.Response(202, json=approval_response())
         if request.url.path == f"/v1/runs/{RUN_ID}/events":
@@ -120,6 +145,48 @@ def lifecycle_handler(
     return handler
 
 
+def approval_command_handler(
+    requests: list[httpx.Request],
+    *,
+    fetched: dict[str, Any] | None = None,
+    approval: dict[str, Any] | None = None,
+    sse_status: int = 200,
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == f"/v1/execution-requests/{REQUEST_ID}":
+            return httpx.Response(
+                200,
+                json=fetched if fetched is not None else fetched_request_response(),
+            )
+        if request.url.path == f"/v1/execution-requests/{REQUEST_ID}/approve":
+            return httpx.Response(
+                202,
+                json=approval if approval is not None else approval_response(),
+            )
+        if request.url.path == f"/v1/runs/{RUN_ID}/events":
+            if sse_status != 200:
+                return httpx.Response(
+                    sse_status,
+                    json={
+                        "error": {
+                            "code": "STREAM_ERROR",
+                            "message": "Stream unavailable",
+                        }
+                    },
+                )
+            return httpx.Response(
+                200,
+                text=sse_event(1, "run.started") + sse_event(2, "run.completed"),
+                headers={"content-type": "text/event-stream"},
+            )
+        if request.url.path == f"/v1/runs/{RUN_ID}":
+            return httpx.Response(200, json=run_response())
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    return handler
+
+
 async def confirm(event: dict[str, Any]) -> bool:
     return True
 
@@ -137,6 +204,11 @@ def body(prompt: Any = "Exact prompt") -> dict[str, Any]:
             {"role": "user", "content": prompt},
         ]
     }
+
+
+def approval_command(*, mention: bool = True) -> str:
+    prefix = "@Codex " if mention else ""
+    return f"{prefix}approve {REQUEST_ID} {PROMPT_HASH}"
 
 
 @pytest.mark.parametrize(
@@ -187,7 +259,7 @@ async def test_admin_only_can_be_disabled() -> None:
         body(), None, {"user_prompt": "Exact prompt"}, None, reject
     )
 
-    assert "not approved" in result
+    assert "explicitly rejected" in result
     assert len(requests) == 1
 
 
@@ -240,8 +312,67 @@ def test_source_wrapped_body_does_not_replace_metadata_prompt() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        approval_command(mention=False),
+        approval_command(),
+        f"APPROVE {REQUEST_ID} {PROMPT_HASH}",
+        f"@CODEX ApPrOvE {REQUEST_ID} {PROMPT_HASH}",
+    ],
+)
+def test_exact_approval_commands_are_parsed(command: str) -> None:
+    parsed = parse_approval_command(command)
+
+    assert parsed is not None
+    assert parsed.request_id == REQUEST_ID
+    assert parsed.prompt_sha256 == PROMPT_HASH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "approve",
+        f"approve {REQUEST_ID}",
+        f"approve {REQUEST_ID} {PROMPT_HASH[:32]}",
+        f"approve {REQUEST_ID} {PROMPT_HASH.upper()}",
+        f"approve {REQUEST_ID.upper()} {PROMPT_HASH}",
+        "approve latest",
+        f"approve not-a-uuid {PROMPT_HASH}",
+        f"approve {REQUEST_ID} {PROMPT_HASH} and execute this too",
+        f"Please run {approval_command()} now",
+    ],
+)
+def test_malformed_or_embedded_approval_commands_are_rejected(command: str) -> None:
+    with pytest.raises(IntegrationError) as raised:
+        parse_approval_command(command)
+
+    assert raised.value.code == "INVALID_APPROVAL_COMMAND"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Review whether we should approve this change.",
+        "The approval policy should remain strict.",
+        f"Do not disapprove {REQUEST_ID} {PROMPT_HASH} automatically.",
+    ],
+)
+def test_normal_prompts_containing_approve_are_not_commands(prompt: str) -> None:
+    assert parse_approval_command(prompt) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "approve latest",
+        f"approve {REQUEST_ID}",
+        f"@Codex approve {REQUEST_ID} {PROMPT_HASH[:20]}",
+        f"approve {REQUEST_ID} {PROMPT_HASH} with extra text",
+    ],
+)
 @pytest.mark.asyncio
-async def test_confirmation_unavailable_prevents_request_creation() -> None:
+async def test_invalid_approval_command_never_creates_request(command: str) -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -249,11 +380,47 @@ async def test_confirmation_unavailable_prevents_request_creation() -> None:
         calls += 1
         return httpx.Response(500)
 
+    result = await configured_pipe(handler).pipe(
+        body(command), {"role": "admin"}, {"user_prompt": command}
+    )
+
+    assert calls == 0
+    assert "INVALID_APPROVAL_COMMAND" in result
+
+
+@pytest.mark.asyncio
+async def test_normal_prompt_with_approve_still_creates_request() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=created_response())
+
+    prompt = "Review whether we should approve this change."
+    result = await configured_pipe(handler).pipe(
+        body(prompt), {"role": "admin"}, {"user_prompt": prompt}, None, reject
+    )
+
+    assert [request.url.path for request in requests] == ["/v1/execution-requests"]
+    assert "explicitly rejected" in result
+
+
+@pytest.mark.asyncio
+async def test_missing_confirmation_support_leaves_created_request_pending() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=created_response())
+
     pipe = configured_pipe(handler)
     result = await pipe.pipe(body(), {"role": "admin"}, {"user_prompt": "Exact prompt"})
 
-    assert "CONFIRMATION_UNAVAILABLE" in result
-    assert calls == 0
+    assert [request.url.path for request in requests] == ["/v1/execution-requests"]
+    assert "pending approval" in result
+    assert "Interactive confirmation was unavailable" in result
+    assert "No run has started" in result
+    assert f"@Codex approve {REQUEST_ID} {PROMPT_HASH}" in result
 
 
 @pytest.mark.asyncio
@@ -291,28 +458,225 @@ async def test_rejection_creates_request_but_never_approves() -> None:
     assert PROMPT_HASH in message
     assert f"{len(prompt.encode('utf-8'))} UTF-8 bytes" in message
     assert message.endswith(prompt)
-    assert "not approved" in result
+    assert "Codex execution rejected" in result
+    assert "explicitly rejected" in result
+    assert "confirmation was unavailable" not in result.lower()
     assert REQUEST_ID in result and PROMPT_HASH in result
-    assert "not deleted" in result
+    assert "remains pending" in result
 
 
+@pytest.mark.parametrize("result_shape", [None, {}, "yes", 1])
 @pytest.mark.asyncio
-async def test_confirmation_error_never_calls_approval() -> None:
+async def test_unsupported_confirmation_result_leaves_request_pending(
+    result_shape: Any,
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(201, json=created_response())
 
-    async def timeout(event: dict[str, Any]) -> bool:
-        raise TimeoutError
+    async def unsupported(event: dict[str, Any]) -> Any:
+        return result_shape
 
     result = await configured_pipe(handler).pipe(
-        body(), {"role": "admin"}, {"user_prompt": "Exact prompt"}, None, timeout
+        body(), {"role": "admin"}, {"user_prompt": "Exact prompt"}, None, unsupported
     )
 
     assert len(requests) == 1
-    assert "not approved" in result
+    assert "pending approval" in result
+    assert "rejected" not in result.lower()
+    assert "cancelled" not in result.lower()
+    assert "not approved by the user" not in result.lower()
+
+
+@pytest.mark.parametrize("raised_error", [RuntimeError("disconnected"), TimeoutError()])
+@pytest.mark.asyncio
+async def test_confirmation_failure_leaves_request_pending_without_approval(
+    raised_error: Exception,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=created_response())
+
+    async def unavailable(event: dict[str, Any]) -> bool:
+        raise raised_error
+
+    prompt = "  full exact prompt\nsecond line  "
+    result = await configured_pipe(handler).pipe(
+        body(prompt),
+        {"role": "admin"},
+        {"user_prompt": prompt},
+        None,
+        unavailable,
+    )
+
+    assert [request.url.path for request in requests] == ["/v1/execution-requests"]
+    assert "Interactive confirmation was unavailable" in result
+    assert "pending approval" in result
+    assert "rejected" not in result.lower()
+    assert prompt in result
+    assert f"{len(prompt.encode('utf-8'))} UTF-8 bytes" in result
+    assert REPOSITORY_ID in result and REQUEST_ID in result and PROMPT_HASH in result
+    assert f"@Codex approve {REQUEST_ID} {PROMPT_HASH}" in result
+
+
+@pytest.mark.asyncio
+async def test_approval_command_fetches_verifies_and_approves_without_creation() -> (
+    None
+):
+    requests: list[httpx.Request] = []
+    statuses: list[dict[str, Any]] = []
+
+    async def emit(event: dict[str, Any]) -> None:
+        statuses.append(event)
+
+    command = approval_command()
+    result = await configured_pipe(approval_command_handler(requests)).pipe(
+        body(command),
+        {"role": "admin"},
+        {"user_prompt": command},
+        emit,
+        None,
+    )
+
+    paths = [request.url.path for request in requests]
+    assert paths == [
+        f"/v1/execution-requests/{REQUEST_ID}",
+        f"/v1/execution-requests/{REQUEST_ID}/approve",
+        f"/v1/runs/{RUN_ID}/events",
+        f"/v1/runs/{RUN_ID}",
+    ]
+    assert "/v1/execution-requests" not in paths
+    approval_request = requests[1]
+    assert json.loads(approval_request.content) == {"promptSha256": PROMPT_HASH}
+    assert "Codex execution completed" in result
+    assert "Finished safely." in result
+    assert TOKEN not in result
+    assert TOKEN not in json.dumps(statuses)
+
+
+@pytest.mark.parametrize(
+    ("fetched", "expected_code"),
+    [
+        (
+            fetched_request_response(request_id="22222222-2222-4222-8222-222222222222"),
+            "APPROVAL_REQUEST_MISMATCH",
+        ),
+        (
+            fetched_request_response(repository_id="another-repository"),
+            "APPROVAL_REPOSITORY_MISMATCH",
+        ),
+        (
+            fetched_request_response(prompt_sha256="b" * 64),
+            "APPROVAL_HASH_MISMATCH",
+        ),
+        (
+            fetched_request_response(status="failed"),
+            "REQUEST_NOT_APPROVABLE",
+        ),
+        (
+            fetched_request_response(prompt=None),
+            "INVALID_RUNNER_RESPONSE",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fetched_request_mismatch_never_calls_approval(
+    fetched: dict[str, Any], expected_code: str
+) -> None:
+    requests: list[httpx.Request] = []
+    command = approval_command()
+    result = await configured_pipe(
+        approval_command_handler(requests, fetched=fetched)
+    ).pipe(body(command), {"role": "admin"}, {"user_prompt": command})
+
+    assert [request.url.path for request in requests] == [
+        f"/v1/execution-requests/{REQUEST_ID}"
+    ]
+    assert expected_code in result
+
+
+@pytest.mark.asyncio
+async def test_wrong_command_hash_fetches_but_never_approves() -> None:
+    requests: list[httpx.Request] = []
+    wrong_hash = "b" * 64
+    command = f"@Codex approve {REQUEST_ID} {wrong_hash}"
+    result = await configured_pipe(approval_command_handler(requests)).pipe(
+        body(command), {"role": "admin"}, {"user_prompt": command}
+    )
+
+    assert [request.url.path for request in requests] == [
+        f"/v1/execution-requests/{REQUEST_ID}"
+    ]
+    assert "APPROVAL_HASH_MISMATCH" in result
+
+
+@pytest.mark.asyncio
+async def test_missing_request_never_calls_approval() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            404,
+            json={
+                "error": {
+                    "code": "REQUEST_NOT_FOUND",
+                    "message": "Execution request was not found",
+                }
+            },
+        )
+
+    command = approval_command()
+    result = await configured_pipe(handler).pipe(
+        body(command), {"role": "admin"}, {"user_prompt": command}
+    )
+
+    assert len(requests) == 1
+    assert "REQUEST_NOT_FOUND" in result
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "completed"])
+@pytest.mark.asyncio
+async def test_idempotent_started_request_follows_existing_run(status: str) -> None:
+    requests: list[httpx.Request] = []
+    fetched = fetched_request_response(status=status, run_id=RUN_ID)
+    existing_approval = {
+        "requestId": REQUEST_ID,
+        "runId": RUN_ID,
+        "status": status,
+    }
+    command = approval_command(mention=False)
+    result = await configured_pipe(
+        approval_command_handler(
+            requests,
+            fetched=fetched,
+            approval=existing_approval,
+        )
+    ).pipe(body(command), {"role": "admin"}, {"user_prompt": command})
+
+    paths = [request.url.path for request in requests]
+    assert paths.count(f"/v1/execution-requests/{REQUEST_ID}/approve") == 1
+    assert "/v1/execution-requests" not in paths
+    assert "Finished safely." in result
+
+
+@pytest.mark.asyncio
+async def test_approval_command_sse_failure_polls_existing_run_once() -> None:
+    requests: list[httpx.Request] = []
+    command = approval_command()
+    result = await configured_pipe(
+        approval_command_handler(requests, sse_status=503)
+    ).pipe(body(command), {"role": "admin"}, {"user_prompt": command})
+
+    paths = [request.url.path for request in requests]
+    assert paths.count(f"/v1/execution-requests/{REQUEST_ID}/approve") == 1
+    assert paths.count(f"/v1/runs/{RUN_ID}") == 1
+    assert "/v1/execution-requests" not in paths
+    assert "Finished safely." in result
 
 
 @pytest.mark.asyncio
@@ -575,6 +939,13 @@ async def test_token_is_redacted_from_runner_final_response() -> None:
 def test_valve_schema_marks_token_as_password() -> None:
     schema = Pipe.Valves.model_json_schema()
     assert schema["properties"]["RUNNER_TOKEN"]["input"]["type"] == "password"
+
+
+def test_pipe_display_title_is_codex() -> None:
+    import codex_runner
+
+    assert "title: Codex\n" in (codex_runner.__doc__ or "")
+    assert "title: Codex Runner" not in (codex_runner.__doc__ or "")
 
 
 @pytest.mark.asyncio
